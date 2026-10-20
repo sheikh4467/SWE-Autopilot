@@ -1,0 +1,1 @@
+"""SWE Autopilot authentication API."""
