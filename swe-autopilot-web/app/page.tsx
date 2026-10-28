@@ -1,19 +1,78 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import Link from "next/link";
+import { useAuthSession } from "@/components/auth-session";
 import { BrandMark } from "@/components/brand-mark";
 import { Button } from "@/components/ui/button";
 
 type AuthMode = "login" | "signup";
-
-type AuthUser = {
-  id: number;
-  email: string;
-  name: string;
-  created_at: string;
-};
+type AuthStep = "form" | "verify" | "success";
+type VerificationProvider = "email" | "google" | "github";
+type AuthSuccessKind = "verified" | "signed-in";
 
 const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
+const VERIFICATION_RESEND_COOLDOWN_SECONDS = 60;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function getStringValue(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function normalizeEmailForDisplay(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function getProviderLabel(provider: VerificationProvider): string {
+  if (provider === "google") return "Google";
+  if (provider === "github") return "GitHub";
+  return "email";
+}
+
+function getOAuthProvider(value: string | null): VerificationProvider | null {
+  return value === "google" || value === "github" ? value : null;
+}
+
+function getAuthErrorMessage(result: unknown, fallback: string): string {
+  if (!isRecord(result)) return fallback;
+
+  const detail = result.detail;
+  if (typeof detail === "string" && detail.trim()) return detail.trim();
+  if (Array.isArray(detail)) {
+    const firstMessage = detail.find((item) => isRecord(item) && typeof item.msg === "string");
+    if (isRecord(firstMessage) && typeof firstMessage.msg === "string" && firstMessage.msg.trim()) {
+      return firstMessage.msg.trim();
+    }
+  }
+  if (isRecord(detail)) {
+    const nestedMessage = getStringValue(detail.message) ?? getStringValue(detail.detail);
+    if (nestedMessage) return nestedMessage;
+  }
+
+  return getStringValue(result.message) ?? fallback;
+}
+
+function getVerificationDetails(result: unknown, fallbackEmail: string): { email: string } | null {
+  if (!isRecord(result)) return null;
+
+  const detail = isRecord(result.detail) ? result.detail : null;
+  const verificationRequired = result.verification_required === true || detail?.verification_required === true;
+  if (!verificationRequired) return null;
+
+  const email = getStringValue(result.email) ?? (detail ? getStringValue(detail.email) : null) ?? fallbackEmail;
+  return { email: normalizeEmailForDisplay(email) };
+}
+
+function getRetryAfterSeconds(response: Response): number | null {
+  const value = response.headers.get("Retry-After");
+  if (!value) return null;
+
+  const seconds = Number.parseInt(value, 10);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
 
 type IconProps = {
   className?: string;
@@ -164,14 +223,20 @@ const platformPillars = [
 export default function Home() {
   const [authOpen, setAuthOpen] = useState(false);
   const [authMode, setAuthMode] = useState<AuthMode>("login");
+  const [authStep, setAuthStep] = useState<AuthStep>("form");
+  const [authSuccessKind, setAuthSuccessKind] = useState<AuthSuccessKind>("signed-in");
   const [showPassword, setShowPassword] = useState(false);
-  const [submitted, setSubmitted] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [authNotice, setAuthNotice] = useState<string | null>(null);
-  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [verificationEmail, setVerificationEmail] = useState("");
+  const [verificationCode, setVerificationCode] = useState("");
+  const [verificationProvider, setVerificationProvider] = useState<VerificationProvider>("email");
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [resendLoading, setResendLoading] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [scrollProgress, setScrollProgress] = useState(0);
+  const { user: currentUser, refresh: refreshSession, logout: logoutSession } = useAuthSession();
 
   useEffect(() => {
     const observer = new IntersectionObserver(
@@ -202,20 +267,63 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (resendCooldown <= 0) return;
+
+    const timeout = window.setTimeout(() => {
+      setResendCooldown((remaining) => Math.max(0, remaining - 1));
+    }, 1000);
+
+    return () => window.clearTimeout(timeout);
+  }, [resendCooldown]);
+
+  useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (params.get("auth") !== "success") return;
+    const authResult = params.get("auth");
+
+    if (authResult === "verify") {
+      const provider = getOAuthProvider(params.get("provider"));
+      const email = params.get("email") ? normalizeEmailForDisplay(params.get("email") as string) : "";
+
+      window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.hash}`);
+
+      if (!provider || !email) {
+        setAuthNotice("We could not start email verification. Please try signing in again.");
+        return;
+      }
+
+      setAuthMode("login");
+      setAuthStep("verify");
+      setAuthSuccessKind("verified");
+      setAuthOpen(true);
+      setAuthError(null);
+      setAuthLoading(false);
+      setResendLoading(false);
+      setVerificationEmail(email);
+      setVerificationCode("");
+      setVerificationProvider(provider);
+      setResendCooldown(VERIFICATION_RESEND_COOLDOWN_SECONDS);
+      return;
+    }
+
+    if (authResult !== "success") {
+      const requestedMode = params.get("openAuth");
+      if (requestedMode === "login" || requestedMode === "signup") {
+        setAuthMode(requestedMode);
+        setAuthOpen(true);
+        setAuthError(null);
+        window.history.replaceState({}, document.title, window.location.pathname);
+      }
+      return;
+    }
 
     const provider = params.get("provider");
     const providerLabel = provider === "github" ? "GitHub" : provider === "google" ? "Google" : "OAuth";
 
-    fetch(`${API_URL}/auth/me`, { credentials: "include" })
-      .then(async (response) => {
-        if (!response.ok) throw new Error("Could not load the authenticated user.");
-        return (await response.json()) as AuthUser;
-      })
+    refreshSession()
       .then((user) => {
-        setCurrentUser(user);
+        if (!user) throw new Error("Could not load the authenticated user.");
         setAuthNotice(`Signed in with ${providerLabel} as ${user.name}.`);
+        window.location.replace("/workspace");
       })
       .catch(() => {
         setAuthNotice(`${providerLabel} authentication completed. Start the API to load your workspace session.`);
@@ -223,14 +331,20 @@ export default function Home() {
       .finally(() => {
         window.history.replaceState({}, document.title, `${window.location.pathname}${window.location.hash}`);
       });
-  }, []);
+  }, [refreshSession]);
 
   const openAuth = (mode: AuthMode) => {
     setAuthMode(mode);
+    setAuthStep("form");
+    setAuthSuccessKind("signed-in");
     setAuthOpen(true);
-    setSubmitted(false);
     setAuthError(null);
     setAuthLoading(false);
+    setResendLoading(false);
+    setVerificationEmail("");
+    setVerificationCode("");
+    setVerificationProvider("email");
+    setResendCooldown(0);
     setMenuOpen(false);
   };
 
@@ -260,18 +374,119 @@ export default function Home() {
         credentials: "include",
         body: JSON.stringify(payload),
       });
-      const result = (await response.json().catch(() => null)) as AuthUser | { detail?: string } | null;
+      const result = (await response.json().catch(() => null)) as unknown;
 
       if (!response.ok) {
-        throw new Error(result && "detail" in result && result.detail ? result.detail : "Authentication failed. Please try again.");
+        if (authMode === "login") {
+          const verification = getVerificationDetails(result, payload.email);
+          if (response.status === 403 && verification) {
+            setAuthStep("verify");
+            setAuthSuccessKind("verified");
+            setVerificationEmail(verification.email);
+            setVerificationCode("");
+            setVerificationProvider("email");
+            setResendLoading(false);
+            setResendCooldown(getRetryAfterSeconds(response) ?? 0);
+            return;
+          }
+        }
+
+        throw new Error(getAuthErrorMessage(result, "Authentication failed. Please try again."));
       }
 
-      setCurrentUser(result as AuthUser);
-      setSubmitted(true);
+      if (authMode === "signup") {
+        if (!isRecord(result) || result.verification_required !== true) {
+          throw new Error("We could not start email verification. Please try again.");
+        }
+
+        const email = normalizeEmailForDisplay(getStringValue(result.email) ?? payload.email);
+        setAuthStep("verify");
+        setAuthSuccessKind("verified");
+        setVerificationEmail(email);
+        setVerificationCode("");
+        setVerificationProvider("email");
+        setResendLoading(false);
+        setResendCooldown(VERIFICATION_RESEND_COOLDOWN_SECONDS);
+        return;
+      }
+
+      const sessionUser = await refreshSession();
+      if (!sessionUser) throw new Error("Signed in, but we could not load your session. Please try again.");
+      window.location.assign("/workspace");
     } catch (error) {
       setAuthError(error instanceof Error ? error.message : "Authentication failed. Please try again.");
     } finally {
       setAuthLoading(false);
+    }
+  };
+
+  const handleVerify = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+
+    if (!verificationEmail) {
+      setAuthError("Enter your email again to request a verification code.");
+      return;
+    }
+    if (verificationCode.length !== 6) {
+      setAuthError("Enter the 6-digit verification code from your email.");
+      return;
+    }
+
+    setAuthLoading(true);
+    setAuthError(null);
+
+    try {
+      const response = await fetch(`${API_URL}/auth/verify-email`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ email: verificationEmail, code: verificationCode }),
+      });
+      const result = (await response.json().catch(() => null)) as unknown;
+
+      if (!response.ok) {
+        throw new Error(getAuthErrorMessage(result, "That verification code is invalid or expired."));
+      }
+
+      const sessionUser = await refreshSession();
+      if (!sessionUser) throw new Error("Your email was verified, but we could not load your session. Please try again.");
+      window.location.assign("/workspace");
+      setVerificationCode("");
+      setResendCooldown(0);
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "That verification code is invalid or expired.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleResendVerification = async () => {
+    if (!verificationEmail || resendLoading || resendCooldown > 0) return;
+
+    setResendLoading(true);
+    setAuthError(null);
+
+    try {
+      const response = await fetch(`${API_URL}/auth/resend-verification`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ email: verificationEmail }),
+      });
+      const result = (await response.json().catch(() => null)) as unknown;
+
+      if (!response.ok) {
+        const retryAfter = getRetryAfterSeconds(response);
+        if (retryAfter) setResendCooldown(retryAfter);
+        throw new Error(getAuthErrorMessage(result, "Unable to resend the verification email. Please try again."));
+      }
+
+      setResendCooldown(VERIFICATION_RESEND_COOLDOWN_SECONDS);
+      setAuthNotice(getAuthErrorMessage(result, "If an unverified account exists, a new verification email has been sent."));
+    } catch (error) {
+      setAuthError(error instanceof Error ? error.message : "Unable to resend the verification email. Please try again.");
+    } finally {
+      setResendLoading(false);
     }
   };
 
@@ -281,10 +496,30 @@ export default function Home() {
   };
 
   const handleLogout = async () => {
-    await fetch(`${API_URL}/auth/logout`, { method: "POST", credentials: "include" }).catch(() => undefined);
-    setCurrentUser(null);
+    await logoutSession();
+    setAuthOpen(false);
+    setAuthStep("form");
+    setVerificationEmail("");
+    setVerificationCode("");
+    setResendCooldown(0);
     setAuthNotice("You have been signed out.");
   };
+
+  const verificationProviderLabel = getProviderLabel(verificationProvider);
+  const authTitle = authStep === "verify"
+    ? "Verify your email."
+    : authStep === "success"
+      ? authSuccessKind === "verified" ? "Account verified." : "Signed in."
+      : authMode === "login" ? "Welcome back." : "Start your workspace.";
+  const authDescription = authStep === "verify"
+    ? verificationProvider === "email"
+      ? "Enter the 6-digit code we sent to your email."
+      : `Enter the 6-digit code sent to continue with ${verificationProviderLabel}.`
+    : authStep === "success"
+      ? authSuccessKind === "verified"
+        ? "Your email is verified and your account is ready for the control room."
+        : "Your SWE Autopilot session is ready."
+      : authMode === "login" ? "Continue orchestrating your software lifecycle." : "Build your first traceable software workflow.";
 
   return (
     <main className="min-h-screen overflow-x-clip bg-ink text-white selection:bg-cyan selection:text-ink">
@@ -309,10 +544,10 @@ export default function Home() {
           </a>
 
           <nav className="hidden items-center gap-8 text-[13px] text-slate-400 lg:flex" aria-label="Primary navigation">
-            <a className="nav-link" href="#platform">Platform</a>
-            <a className="nav-link" href="#workflow">Workflow</a>
-            <a className="nav-link" href="#security">Security</a>
-            <a className="nav-link" href="#about">About</a>
+            <Link className="nav-link" href="/platform">Platform</Link>
+            <Link className="nav-link" href="/workflow">Workflow</Link>
+            <Link className="nav-link" href="/security">Security</Link>
+            <Link className="nav-link" href="/about">About</Link>
           </nav>
 
           <div className="hidden items-center gap-3 sm:flex">
@@ -346,10 +581,10 @@ export default function Home() {
         {menuOpen && (
           <div className="border-t border-white/[0.07] px-5 py-5 sm:hidden">
             <nav className="flex flex-col gap-4 text-sm text-slate-300" aria-label="Mobile navigation">
-              <a href="#platform" onClick={() => setMenuOpen(false)}>Platform</a>
-              <a href="#workflow" onClick={() => setMenuOpen(false)}>Workflow</a>
-              <a href="#security" onClick={() => setMenuOpen(false)}>Security</a>
-              <a href="#about" onClick={() => setMenuOpen(false)}>About</a>
+              <Link href="/platform" onClick={() => setMenuOpen(false)}>Platform</Link>
+              <Link href="/workflow" onClick={() => setMenuOpen(false)}>Workflow</Link>
+              <Link href="/security" onClick={() => setMenuOpen(false)}>Security</Link>
+              <Link href="/about" onClick={() => setMenuOpen(false)}>About</Link>
               <div className="mt-2 flex gap-3 border-t border-white/[0.08] pt-4">
                 {currentUser ? (
                   <Button variant="outline" className="flex-1" onClick={handleLogout}>Sign out</Button>
@@ -382,10 +617,10 @@ export default function Home() {
             <Button className="group" onClick={() => openAuth("signup")}>
               Enter the control room <ArrowUpRight className="transition duration-300 group-hover:translate-x-0.5 group-hover:-translate-y-0.5" />
             </Button>
-            <a className="inline-flex items-center justify-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-5 py-3 text-sm font-semibold text-white transition duration-300 hover:-translate-y-0.5 hover:border-white/25 hover:bg-white/[0.07]" href="#workflow">
+            <Link className="inline-flex items-center justify-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-5 py-3 text-sm font-semibold text-white transition duration-300 hover:-translate-y-0.5 hover:border-white/25 hover:bg-white/[0.07]" href="/workflow">
               <span className="grid size-5 place-items-center rounded-full bg-white/10"><Play className="size-3" /></span>
               See how it works
-            </a>
+            </Link>
           </div>
           <div className="mt-10 flex flex-wrap gap-x-6 gap-y-3 text-xs text-slate-500 animate-fade-up [animation-delay:400ms]">
             <span className="inline-flex items-center gap-2"><Check className="text-cyan" /> Human approval gates</span>
@@ -427,9 +662,9 @@ export default function Home() {
           <div className="stage-caption"><span>REQ-001</span><span className="stage-caption-line" /><span>DEPLOY</span></div>
         </div>
 
-        <a className="absolute bottom-5 left-5 hidden items-center gap-3 text-[10px] uppercase tracking-[0.24em] text-slate-500 transition hover:text-white lg:flex" href="#platform">
+        <Link className="absolute bottom-5 left-5 hidden items-center gap-3 text-[10px] uppercase tracking-[0.24em] text-slate-500 transition hover:text-white lg:flex" href="/platform">
           <span className="scroll-line" /> Scroll to explore <ChevronDown />
-        </a>
+        </Link>
       </section>
 
       <section id="platform" className="relative mx-auto max-w-7xl scroll-mt-24 px-5 pb-28 sm:px-8 lg:px-10 lg:pb-40">
@@ -603,18 +838,32 @@ export default function Home() {
         <div className="auth-backdrop" role="presentation" onClick={() => setAuthOpen(false)}>
           <div className="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title" onClick={(event) => event.stopPropagation()}>
             <button className="auth-close" aria-label="Close authentication dialog" onClick={() => setAuthOpen(false)}><X /></button>
-            <div className="mb-8"><BrandMark /><h2 id="auth-title" className="mt-8 text-3xl font-semibold tracking-[-0.06em]">{authMode === "login" ? "Welcome back." : "Start your workspace."}</h2><p className="mt-2 text-sm leading-6 text-slate-500">{authMode === "login" ? "Continue orchestrating your software lifecycle." : "Build your first traceable software workflow."}</p></div>
-            <div className="auth-tabs" role="tablist" aria-label="Authentication mode">
-              <button className={authMode === "login" ? "is-active" : ""} role="tab" aria-selected={authMode === "login"} onClick={() => { setAuthMode("login"); setSubmitted(false); setAuthError(null); }}>Sign in</button>
-              <button className={authMode === "signup" ? "is-active" : ""} role="tab" aria-selected={authMode === "signup"} onClick={() => { setAuthMode("signup"); setSubmitted(false); setAuthError(null); }}>Create account</button>
-            </div>
-            {submitted ? (
+            <div className="mb-8"><BrandMark /><h2 id="auth-title" className="mt-8 text-3xl font-semibold tracking-[-0.06em]">{authTitle}</h2><p className="mt-2 text-sm leading-6 text-slate-500">{authDescription}</p></div>
+            {authStep === "form" && <div className="auth-tabs" role="tablist" aria-label="Authentication mode">
+              <button className={authMode === "login" ? "is-active" : ""} role="tab" aria-selected={authMode === "login"} onClick={() => { setAuthMode("login"); setAuthStep("form"); setAuthError(null); setVerificationCode(""); setResendCooldown(0); }}>Sign in</button>
+              <button className={authMode === "signup" ? "is-active" : ""} role="tab" aria-selected={authMode === "signup"} onClick={() => { setAuthMode("signup"); setAuthStep("form"); setAuthError(null); setVerificationCode(""); setResendCooldown(0); }}>Create account</button>
+            </div>}
+            {authStep === "success" ? (
               <div className="auth-success">
                 <span className="auth-success-icon"><Check /></span>
-                <h3>{authMode === "login" ? `Welcome back${currentUser ? `, ${currentUser.name}` : ""}.` : "Workspace created."}</h3>
-                <p>Your SWE Autopilot account is connected and ready for the control room.</p>
-                <Button className="mt-6 w-full" onClick={() => { setSubmitted(false); setAuthError(null); }}>Back to form</Button>
+                <h3>{authSuccessKind === "verified" ? "Account verified." : `Signed in${currentUser ? `, ${currentUser.name}` : ""}.`}</h3>
+                <p>{authSuccessKind === "verified" ? "Your email is verified and you are signed in to SWE Autopilot." : "Your SWE Autopilot account is connected and ready for the control room."}</p>
+                <Button className="mt-6 w-full" onClick={() => { setAuthStep("form"); setAuthError(null); }}>Back to form</Button>
               </div>
+            ) : authStep === "verify" ? (
+              <form className="auth-form" onSubmit={handleVerify}>
+                <div className="verification-context">
+                  <span className="verification-context-icon"><Shield className="size-3.5" /></span>
+                  <p>A one-time code was requested for <strong>{verificationEmail}</strong>. You must receive and enter it to continue; an unverified address cannot access a workspace.</p>
+                </div>
+                <label>Verification code<input className="verification-code" name="verificationCode" type="text" inputMode="numeric" autoComplete="one-time-code" pattern="[0-9]{6}" maxLength={6} placeholder="000000" value={verificationCode} onChange={(event) => setVerificationCode(event.target.value.replace(/\D/g, "").slice(0, 6))} required /></label>
+                {authError && <div className="auth-error" role="alert">{authError}</div>}
+                <Button type="submit" className="mt-2 w-full" disabled={authLoading || resendLoading}>{authLoading ? "Verifying…" : "Verify email"}<Check /></Button>
+                <button type="button" className="verification-resend" onClick={handleResendVerification} disabled={authLoading || resendLoading || resendCooldown > 0}>
+                  {resendLoading ? "Sending verification email…" : resendCooldown > 0 ? `Resend code in ${resendCooldown}s` : "Resend verification code"}
+                </button>
+                <button type="button" className="verification-back" onClick={() => { setAuthStep("form"); setAuthError(null); setVerificationCode(""); setResendCooldown(0); }}>Use a different email</button>
+              </form>
             ) : (
               <form className="auth-form" onSubmit={handleSubmit}>
                 <div className="oauth-actions" aria-label="Social authentication options">
@@ -622,12 +871,12 @@ export default function Home() {
                   <button type="button" className="oauth-button" onClick={() => handleOAuth("github")}><GitHubIcon />Continue with GitHub</button>
                 </div>
                 <div className="auth-divider"><span>or continue with email</span></div>
-                {authMode === "signup" && <label>Full name<input name="name" type="text" placeholder="Ada Lovelace" required /></label>}
-                <label>Work email<input name="email" type="email" placeholder="you@company.com" required /></label>
+                {authMode === "signup" && <label>Full name<input name="name" type="text" placeholder="Ada Lovelace" maxLength={24} autoComplete="name" required /><span className="auth-field-hint">Maximum 24 characters</span></label>}
+                <label>Work email<input name="email" type="email" placeholder="you@company.com" maxLength={320} autoComplete="email" required /><span className="auth-field-hint">You must be able to receive the verification code</span></label>
                 <label>Password<div className="password-field"><input name="password" type={showPassword ? "text" : "password"} placeholder="••••••••" minLength={8} required /><button type="button" aria-label={showPassword ? "Hide password" : "Show password"} onClick={() => setShowPassword((visible) => !visible)}>{showPassword ? <EyeOff /> : <Eye />}</button></div></label>
                 {authMode === "login" && <div className="flex justify-end"><button type="button" className="text-xs text-cyan transition hover:text-white">Forgot password?</button></div>}
                 {authError && <div className="auth-error" role="alert">{authError}</div>}
-                <Button type="submit" className="mt-2 w-full" disabled={authLoading}>{authLoading ? "Connecting…" : authMode === "login" ? "Sign in to Autopilot" : "Create workspace"}<ArrowUpRight /></Button>
+                <Button type="submit" className="mt-2 w-full" disabled={authLoading}>{authLoading ? "Connecting…" : authMode === "login" ? "Sign in to Autopilot" : "Create account"}<ArrowUpRight /></Button>
                 <p className="text-center text-[11px] leading-5 text-slate-600">By continuing, you agree to the workspace terms and release-gate policy.</p>
               </form>
             )}

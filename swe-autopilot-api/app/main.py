@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import re
+import socket
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import urlencode
@@ -19,13 +21,23 @@ from starlette.responses import RedirectResponse
 from .db import (
     UserExistsError,
     consume_oauth_state,
-    create_local_user,
+    create_or_reuse_local_user,
+    ensure_default_workspace,
     find_or_create_oauth_user,
+    get_workspace_stats,
     get_user_by_email,
     get_user_by_id,
+    invalidate_latest_verification_code,
     init_db,
+    issue_verification_code,
+    mark_user_email_verified,
+    record_workspace_event,
     save_oauth_state,
+    VerificationCodeCooldownError,
+    verify_email_code,
 )
+from . import email_validation
+from . import mail
 from .security import hash_password, verify_password
 
 
@@ -36,10 +48,11 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000").strip().rstrip("
 SESSION_SECRET = os.getenv(
     "SESSION_SECRET", "local-development-session-secret-change-me"
 ).strip()
+MAX_FULL_NAME_LENGTH = 24
 
 
 class SignupPayload(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=MAX_FULL_NAME_LENGTH)
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=1024)
 
@@ -49,16 +62,85 @@ class LoginPayload(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
-def _normalize_email(email: str) -> str:
+class VerifyEmailPayload(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    code: str = Field(min_length=1, max_length=32)
+
+
+class ResendVerificationPayload(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+
+
+_EMAIL_LOCAL_PART_RE = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+$")
+_EMAIL_DOMAIN_LABEL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _normalize_name(name: str) -> str:
+    normalized = " ".join(name.strip().split())
+    if not normalized:
+        raise HTTPException(status_code=422, detail="Full name must not be blank.")
+    if len(normalized) > MAX_FULL_NAME_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Full name must be {MAX_FULL_NAME_LENGTH} characters or fewer.",
+        )
+    if any(ord(character) < 32 for character in normalized):
+        raise HTTPException(status_code=422, detail="Full name contains invalid characters.")
+    return normalized
+
+
+def _check_email_domain(domain: str) -> None:
+    if not _env_bool("EMAIL_DOMAIN_CHECK", True):
+        return
+    try:
+        # This confirms that the domain can resolve. It does not claim that a
+        # particular mailbox exists; only the OTP can prove mailbox access.
+        socket.getaddrinfo(domain, 25, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="The email domain could not be reached. Check the address and try again.",
+        ) from exc
+
+
+def _normalize_email(email: str, *, check_domain: bool = True) -> str:
     normalized = email.strip().lower()
+    if len(normalized) > 320 or any(ord(character) < 33 or character.isspace() for character in normalized):
+        raise HTTPException(status_code=422, detail="Please provide a valid email address.")
+
+    if normalized.count("@") != 1:
+        raise HTTPException(status_code=422, detail="Please provide a valid email address.")
+
+    local_part, domain = normalized.rsplit("@", 1)
     if (
-        len(normalized) > 320
-        or normalized.count("@") != 1
-        or not normalized.split("@", 1)[0]
-        or not normalized.split("@", 1)[1]
-        or " " in normalized
+        not local_part
+        or len(local_part) > 64
+        or local_part.startswith(".")
+        or local_part.endswith(".")
+        or ".." in local_part
+        or not _EMAIL_LOCAL_PART_RE.fullmatch(local_part)
+        or len(domain) > 253
+        or "." not in domain
     ):
         raise HTTPException(status_code=422, detail="Please provide a valid email address.")
+
+    labels = domain.split(".")
+    if (
+        len(labels) < 2
+        or len(labels[-1]) < 2
+        or any(not _EMAIL_DOMAIN_LABEL_RE.fullmatch(label) for label in labels)
+    ):
+        raise HTTPException(status_code=422, detail="Please provide a valid email address.")
+
+    if check_domain:
+        _check_email_domain(domain)
     return normalized
 
 
@@ -144,7 +226,89 @@ def _redirect_uri(provider: str) -> str:
 
 def _success_redirect(provider: str) -> str:
     query = urlencode({"auth": "success", "provider": provider})
+    return f"{FRONTEND_URL}/workspace?{query}"
+
+
+def _verification_redirect(provider: str, email: str) -> str:
+    query = urlencode({"auth": "verify", "provider": provider, "email": email})
     return f"{FRONTEND_URL}/?{query}"
+
+
+def send_verification_email(recipient: str, code: str) -> None:
+    """Patchable application boundary around the SMTP helper."""
+
+    mail.send_verification_email(recipient, code)
+
+
+def _send_verification_code(
+    user: dict[str, Any], *, enforce_cooldown: bool = True
+) -> None:
+    code = issue_verification_code(
+        int(user["id"]),
+        str(user["email"]),
+        enforce_cooldown=enforce_cooldown,
+    )
+    try:
+        send_verification_email(str(user["email"]), code)
+    except mail.MailConfigurationError as exc:
+        invalidate_latest_verification_code(int(user["id"]))
+        raise HTTPException(
+            status_code=503,
+            detail="Email verification is not configured.",
+        ) from exc
+    except mail.MailDeliveryError as exc:
+        invalidate_latest_verification_code(int(user["id"]))
+        raise HTTPException(
+            status_code=503,
+            detail="Unable to send verification email.",
+        ) from exc
+
+
+async def _validate_signup_email(email: str, request: Request) -> None:
+    """Require a confirmed ZeroBounce result before creating a local user."""
+
+    client_host = request.client.host if request.client is not None else ""
+    try:
+        result = await email_validation.validate_email(
+            email,
+            ip_address=client_host,
+        )
+    except email_validation.EmailValidationConfigurationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Email validation is not configured.",
+        ) from exc
+    except email_validation.EmailValidationServiceError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Email validation is temporarily unavailable. Please try again.",
+        ) from exc
+
+    if result.status == "valid" and result.sub_status not in {
+        "alias_address",
+        "accept_all",
+        "role_based_accept_all",
+        "role_based_catch_all",
+    }:
+        return
+
+    if result.status == "invalid" and result.sub_status == "possible_typo" and result.did_you_mean:
+        raise HTTPException(
+            status_code=422,
+            detail=f"This email address appears invalid. Did you mean {result.did_you_mean}?",
+        )
+
+    if result.status in {"invalid", "spamtrap", "abuse", "do_not_mail"}:
+        raise HTTPException(
+            status_code=422,
+            detail="This email address could not be verified. Please use a valid email address.",
+        )
+
+    # catch-all and unknown cannot prove that this specific mailbox exists.
+    raise HTTPException(
+        status_code=422,
+        detail="We could not confirm that this mailbox exists. Please use a different email address.",
+    )
 
 
 def _oauth_client(config: dict[str, str], redirect_uri: str) -> AsyncOAuth2Client:
@@ -167,13 +331,14 @@ async def _google_identity(
     profile = response.json()
     provider_account_id = str(profile.get("sub") or "").strip()
     email = str(profile.get("email") or "").strip()
-    if not provider_account_id or not email:
+    email_verified = profile.get("email_verified") is True
+    if not provider_account_id or not email or not email_verified:
         raise HTTPException(
             status_code=400,
-            detail="Google did not return a usable account id and email address.",
+            detail="Google did not return a verified email address.",
         )
     name = str(profile.get("name") or email.split("@", 1)[0]).strip()
-    return provider_account_id, email, name[:120]
+    return provider_account_id, email, name[:MAX_FULL_NAME_LENGTH]
 
 
 async def _github_identity(
@@ -184,53 +349,41 @@ async def _github_identity(
     response.raise_for_status()
     profile = response.json()
     provider_account_id = str(profile.get("id") or "").strip()
-    email = str(profile.get("email") or "").strip()
-
-    # GitHub may omit the public email from /user. The user:email scope lets us
-    # retrieve the account's verified/primary addresses from /user/emails.
-    if not email:
-        email_response = await client.get(config["email_endpoint"], headers=headers)
-        email_response.raise_for_status()
-        addresses = email_response.json()
-        if isinstance(addresses, list):
-            preferred = next(
-                (
-                    item.get("email")
-                    for item in addresses
-                    if isinstance(item, dict)
-                    and item.get("primary")
-                    and item.get("verified")
-                    and item.get("email")
-                ),
-                None,
-            )
-            verified = next(
-                (
-                    item.get("email")
-                    for item in addresses
-                    if isinstance(item, dict)
-                    and item.get("verified")
-                    and item.get("email")
-                ),
-                None,
-            )
-            fallback = next(
-                (
-                    item.get("email")
-                    for item in addresses
-                    if isinstance(item, dict) and item.get("email")
-                ),
-                None,
-            )
-            email = str(preferred or verified or fallback or "").strip()
+    email_response = await client.get(config["email_endpoint"], headers=headers)
+    email_response.raise_for_status()
+    addresses = email_response.json()
+    email = ""
+    if isinstance(addresses, list):
+        preferred = next(
+            (
+                item.get("email")
+                for item in addresses
+                if isinstance(item, dict)
+                and item.get("primary")
+                and item.get("verified")
+                and item.get("email")
+            ),
+            None,
+        )
+        verified = next(
+            (
+                item.get("email")
+                for item in addresses
+                if isinstance(item, dict)
+                and item.get("verified")
+                and item.get("email")
+            ),
+            None,
+        )
+        email = str(preferred or verified or "").strip()
 
     if not provider_account_id or not email:
         raise HTTPException(
             status_code=400,
-            detail="GitHub did not return a usable account id and email address.",
+            detail="GitHub did not return a verified email address.",
         )
     name = str(profile.get("name") or profile.get("login") or email.split("@", 1)[0]).strip()
-    return provider_account_id, email, name[:120]
+    return provider_account_id, email, name[:MAX_FULL_NAME_LENGTH]
 
 
 @asynccontextmanager
@@ -272,6 +425,7 @@ async def oauth_login(provider: str) -> RedirectResponse:
         authorization_url, state = client.create_authorization_url(
             config["authorization_endpoint"],
             redirect_uri=redirect_uri,
+            prompt="select_account",
         )
         save_oauth_state(state, provider, redirect_uri)
     except Exception as exc:
@@ -329,8 +483,28 @@ async def oauth_callback(provider: str, request: Request) -> RedirectResponse:
     finally:
         await client.aclose()
 
-    email = _normalize_email(email)
+    email = _normalize_email(email, check_domain=False)
     user = find_or_create_oauth_user(provider, provider_account_id, email, name)
+
+    if not user.get("email_verified_at"):
+        if not mail.email_verification_required():
+            verified_user = mark_user_email_verified(int(user["id"]))
+            if verified_user is not None:
+                user = verified_user
+        else:
+            try:
+                _send_verification_code(user)
+            except VerificationCodeCooldownError:
+                # A valid, recently sent code remains usable. Do not issue a
+                # second message while the resend cooldown is active.
+                pass
+            return RedirectResponse(
+                _verification_redirect(provider, str(user["email"])),
+                status_code=status.HTTP_302_FOUND,
+            )
+
+    ensure_default_workspace(int(user["id"]), str(user["name"]))
+    record_workspace_event(int(user["id"]), "oauth_login")
     _set_authenticated_user(request, user)
     return RedirectResponse(_success_redirect(provider), status_code=status.HTTP_302_FOUND)
 
@@ -338,20 +512,31 @@ async def oauth_callback(provider: str, request: Request) -> RedirectResponse:
 @app.post("/auth/signup")
 async def signup(payload: SignupPayload, request: Request) -> dict[str, Any]:
     email = _normalize_email(payload.email)
-    name = payload.name.strip()
-    if not name:
-        raise HTTPException(status_code=422, detail="Name must not be blank.")
+    name = _normalize_name(payload.name)
+
+    await _validate_signup_email(email, request)
 
     try:
-        user = create_local_user(email, name, hash_password(payload.password))
+        user = create_or_reuse_local_user(email, name, hash_password(payload.password))
     except UserExistsError as exc:
         raise HTTPException(
             status_code=409,
             detail="An account with that email already exists.",
         ) from exc
 
-    _set_authenticated_user(request, user)
-    return _public_user(user)
+    try:
+        _send_verification_code(user)
+    except VerificationCodeCooldownError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="Please wait before requesting another verification email.",
+            headers={"Retry-After": str(exc.retry_after)},
+        ) from exc
+    return {
+        "verification_required": True,
+        "email": email,
+        "message": "If this address can receive email, check it for a verification code.",
+    }
 
 
 @app.post("/auth/login")
@@ -361,13 +546,67 @@ async def login(payload: LoginPayload, request: Request) -> dict[str, Any]:
     if user is None or not verify_password(payload.password, user.get("password_hash")):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
+    if not user.get("email_verified_at"):
+        try:
+            _send_verification_code(user)
+        except VerificationCodeCooldownError:
+            # A recently issued code is still valid; do not send a duplicate.
+            pass
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "verification_required": True,
+                "email": email,
+                "message": "Email verification is required before login.",
+            },
+        )
+
+    ensure_default_workspace(int(user["id"]), str(user["name"]))
+    record_workspace_event(int(user["id"]), "login")
     _set_authenticated_user(request, user)
     return _public_user(user)
+
+
+@app.post("/auth/verify-email")
+async def verify_email(payload: VerifyEmailPayload, request: Request) -> dict[str, Any]:
+    email = _normalize_email(payload.email)
+    user = verify_email_code(email, payload.code)
+    if user is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+
+    ensure_default_workspace(int(user["id"]), str(user["name"]))
+    record_workspace_event(int(user["id"]), "email_verified")
+    _set_authenticated_user(request, user)
+    return _public_user(user)
+
+
+@app.post("/auth/resend-verification")
+async def resend_verification(payload: ResendVerificationPayload) -> dict[str, Any]:
+    email = _normalize_email(payload.email)
+    user = get_user_by_email(email)
+    if user is not None and not user.get("email_verified_at"):
+        try:
+            _send_verification_code(user)
+        except VerificationCodeCooldownError:
+            # Keep the response identical for unknown, verified, and
+            # cooldown-limited addresses.
+            pass
+    return {
+        "ok": True,
+        "message": "If an unverified account exists, a verification email has been sent.",
+    }
 
 
 @app.get("/auth/me")
 async def me(request: Request) -> dict[str, Any]:
     return _public_user(_current_user(request))
+
+
+@app.get("/workspace/stats")
+async def workspace_stats(request: Request) -> dict[str, Any]:
+    user = _current_user(request)
+    ensure_default_workspace(int(user["id"]), str(user["name"]))
+    return get_workspace_stats(int(user["id"]))
 
 
 @app.post("/auth/logout")
